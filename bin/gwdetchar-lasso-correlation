@@ -71,6 +71,8 @@ parser.add_argument('-o', '--output-dir', default=os.curdir,
                     help='output directory for plots')
 parser.add_argument('-f', '--channel-file', type=os.path.abspath,
                     help='path for channel file')
+parser.add_argument('-F', '--segment-file', type=os.path.abspath,
+                    help='path for segment file')
 parser.add_argument('-T', '--trend-type', default='minute',
                     choices=['second', 'minute'],
                     help='type of trend for correlation')
@@ -104,14 +106,51 @@ lsig.add_argument('-L', '--line-size-primary', default=1, type=float,
 lsig.add_argument('-l', '--line-size-aux', default=0.75, type=float,
                   help='line width of auxilary channel')
 
+
+class LassoSegment:
+    def __init__(self, start, stop, primaryts, auxdata):
+        self.start = start
+        self.stop = stop
+        self.primaryts = primaryts
+        self.primaryts_mean = numpy.mean(primaryts.value)
+        self.primaryts_std = numpy.std(primaryts.value)
+        self.auxdata = auxdata
+
+
+def descaler(l, *coef):
+    if coef:
+        return [((x * primary_std * coef[0]) + primary_mean) for x in l]
+    else:
+        return [((x * primary_std) + primary_mean) for x in l]
+
+
+def read_seg_file(fname):
+    segments = []
+    seg_file = open(fname, 'r')
+    l = seg_file.readline()
+
+    while l:
+        line = l.strip()
+        if line:
+            segment = line.split(' ')
+            segments.append(segment)
+        l = seg_file.readline()
+
+    return segments
+
+
 args = parser.parse_args()
+seg_file_name = args.seg_file
+segment_blocks = read_seg_file(seg_file_name)
+stitched_start = segment_blocks[0][0]
+stitched_end = segment_blocks[-1][1]
 
 # set up logger
 logger = cli.logger(name=os.path.basename(__file__))
 
 # get run params
-start = int(args.gpsstart)
-end = int(args.gpsend)
+#start = int(args.gpsstart)
+#end = int(args.gpsend)
 pad = args.filter_padding
 auto_xlabel = ('Time [hours] from '
                + re.sub(r'\.0+', '',
@@ -132,79 +171,16 @@ if args.primary_frametype is None:
         raise type(exc)("Could not determine primary channel's frametype, "
                         "please specify with --primary-frametype")
 
-# create output directory
 if not os.path.isdir(args.output_dir):
     os.makedirs(args.output_dir)
 os.chdir(args.output_dir)
-
-# multiprocessing for plots
-nprocplot = (args.nproc_plot or args.nproc) if USETEX else 1
-
-# bandpass primary
-if args.band_pass:
-    try:
-        flower, fupper = args.band_pass
-    except TypeError:
-        flower, fupper = None
-
-    logger.info("-- Loading primary channel data")
-    bandts = get_data(
-        primary, start-pad, end+pad, verbose='Reading primary:'.rjust(30),
-        frametype=args.primary_frametype, nproc=args.nproc)
-    if flower < 0 or fupper >= float((bandts.sample_rate/2.).value):
-        raise ValueError("bandpass frequency is out of range for this "
-                         "channel, band (Hz): {0}, sample rate: {1}".format(
-                             args.band_pass, bandts.sample_rate))
-
-    # get darm BLRMS
-    logger.debug("-- Filtering data")
-    if args.trend_type == 'minute':
-        stride = 60
-    else:
-        stride = 1
-    if flower:
-        darmblrms = (
-            bandts.highpass(flower/2., fstop=flower/4.,
-                            filtfilt=False, ftype='butter')
-            .notch(60, filtfilt=False)
-            .bandpass(flower, fupper, fstop=[flower/2., fupper*1.5],
-                      filtfilt=False, ftype='butter')
-            .crop(start, end).rms(stride))
-        darmblrms.name = '%s %s-%s Hz BLRMS' % (primary, flower, fupper)
-    else:
-        darmblrms = bandts.notch(60).crop(start, end).rms(stride)
-        darmblrms.name = '%s RMS' % primary
-
-    primaryts = darmblrms
-
-else:
-    # load primary channel data
-    logger.info("-- Loading primary channel data")
-    primaryts = get_data(primary, start, end, frametype=args.primary_frametype,
-                         verbose='Reading:'.rjust(30),
-                         nproc=args.nproc).crop(start, end)
-
-if args.remove_outliers:
-    logger.debug("-- Removing outliers above %f sigma" % args.remove_outliers)
-    gwlasso.remove_outliers(primaryts, args.remove_outliers)
-
-primary_mean = numpy.mean(primaryts.value)
-primary_std = numpy.std(primaryts.value)
-
-
-def descaler(l, *coef):
-    if coef:
-        return [((x * primary_std * coef[0]) + primary_mean) for x in l]
-    else:
-        return [((x * primary_std) + primary_mean) for x in l]
-
 
 # get aux data
 logger.info("-- Loading auxiliary channel data")
 if args.channel_file is None:
     host, port = io_nds2.host_resolution_order(args.ifo)[0]
     channels = ChannelList.query_nds2('*.mean', host=host, port=port,
-                                      type='m-trend')
+                                       type='m-trend')
 else:
     with open(args.channel_file, 'r') as f:
         channels = [name.rstrip('\n') for name in f]
@@ -216,35 +192,134 @@ if args.trend_type == 'minute':
 else:
     frametype = '%s_T' % args.ifo  # for second trends
 
-# read aux channels
-auxdata = get_data(
-    channels, start, end, verbose='Reading:'.rjust(30),
-    frametype=frametype, nproc=args.nproc, pad=0).crop(start, end)
+# multiprocessing for plots
+nprocplot = (args.nproc_plot or args.nproc) if USETEX else 1
+lasso_segs = []
 
-# -- removes flat data to be re-introdused later
+for seg in segment_blocks:
+    # bandpass primary
+    start = seg[0]
+    end = seg[1]
 
-logger.info('-- Pre-processing auxiliary channel data')
+    if args.band_pass:
+        try:
+            flower, fupper = args.band_pass
+        except TypeError:
+            flower, fupper = None
 
-auxdata = gwlasso.remove_flat(auxdata)
-flattab = Table(data=(list(set(channels) - set(auxdata.keys())),),
+        logger.info("-- Loading primary channel data")
+        bandts = get_data(
+            primary, start-pad, end+pad, verbose='Reading primary:'.rjust(30),
+            frametype=args.primary_frametype, nproc=args.nproc)
+        if flower < 0 or fupper >= float((bandts.sample_rate/2.).value):
+            raise ValueError("bandpass frequency is out of range for this "
+                             "channel, band (Hz): {0}, sample rate: {1}".format(
+                                 args.band_pass, bandts.sample_rate))
+
+        # get darm BLRMS
+        logger.debug("-- Filtering data")
+        if args.trend_type == 'minute':
+            stride = 60
+        else:
+            stride = 1
+        if flower:
+            darmblrms = (
+                bandts.highpass(flower/2., fstop=flower/4.,
+                                filtfilt=False, ftype='butter')
+                .notch(60, filtfilt=False)
+                .bandpass(flower, fupper, fstop=[flower/2., fupper*1.5],
+                          filtfilt=False, ftype='butter')
+                .crop(start, end).rms(stride))
+            darmblrms.name = '%s %s-%s Hz BLRMS' % (primary, flower, fupper)
+        else:
+            darmblrms = bandts.notch(60).crop(start, end).rms(stride)
+            darmblrms.name = '%s RMS' % primary
+
+        primaryts = darmblrms
+
+    else:
+        # load primary channel data
+        logger.info("-- Loading primary channel data")
+        primaryts = get_data(primary, start, end, frametype=args.primary_frametype,
+                             verbose='Reading:'.rjust(30),
+                             nproc=args.nproc).crop(start, end)
+
+    if args.remove_outliers:
+        logger.debug("-- Removing outliers above %f sigma" % args.remove_outliers)
+        gwlasso.remove_outliers(primaryts, args.remove_outliers)
+
+    #primary_mean = numpy.mean(primaryts.value)
+    #primary_std = numpy.std(primaryts.value)
+
+    # read aux channels
+    auxdata = get_data(
+        channels, start, end, verbose='Reading:'.rjust(30),
+        frametype=frametype, nproc=args.nproc, pad=0).crop(start, end)
+
+    lasso_seg = LassoSegment(start, end, primaryts, auxdata)
+    lasso_segs.append(lasso_seg)
+
+    # -- removes flat data to be re-introdused later
+
+    #logger.info('-- Pre-processing auxiliary channel data')
+
+    #auxdata = gwlasso.remove_flat(auxdata)
+    #flattab = Table(data=(list(set(channels) - set(auxdata.keys())),),
+    #                names=('Channels',))
+    #logger.debug('Removed {0} channels with flat data'.format(len(flattab)))
+    #logger.debug('{0} channels remaining'.format(len(auxdata)))
+
+    # -- remove bad data
+
+    #logger.info("Removing any channels with bad data...")
+    #nbefore = len(auxdata)
+    #auxdata = gwlasso.remove_bad(auxdata)
+    #nafter = len(auxdata)
+    #logger.debug('Removed {0} channels with bad data'.format(nbefore - nafter))
+    #logger.debug('{0} channels remaining'.format(nafter))
+    #data = numpy.array([scale(ts.value) for ts in auxdata.values()]).T
+    #lasso_seg = LassoSegment(start, end, primaryts, auxdata)
+    #lasso_segs.append(lasso_seg)
+
+# -- stitch segments and remove bad channels ----------------------------------
+
+logger.info('Stitching and preprocessing channel data')
+
+stitched_raw_primary_values = []
+stitched_scaled_primary_values = []
+stitched_raw_auxdata = dict()  #[[] for i in range(len(lasso_segs[0].auxdata))]
+for chan in lasso_segs[0].auxdata.keys():
+    stitched_raw_auxdata[chan] = []
+#stitched_scaled_auxdata = [[] for i in range(len(lasso_segs[0].auxdata))]
+
+for lasso_seg in lasso_segs:
+    stitched_raw_primary_values.extend(lasso_seg.primaryts.value)
+    for chan in stitched_raw_auxdata:
+        ts = lasso_seg.auxdata[chan]
+        stitched_raw_auxdata[chan].extend(ts.value)
+
+stitched_raw_auxdata = gwlasso.remove_flat(stitched_raw_auxdata)
+flattab = Table(data=(list(set(channels) - set(stitched_raw_auxdata.keys())),),
                 names=('Channels',))
 logger.debug('Removed {0} channels with flat data'.format(len(flattab)))
-logger.debug('{0} channels remaining'.format(len(auxdata)))
+logger.debug('{0} channels remaining'.format(len(stitched_raw_auxdata)))
 
 # -- remove bad data
 
 logger.info("Removing any channels with bad data...")
-nbefore = len(auxdata)
-auxdata = gwlasso.remove_bad(auxdata)
-nafter = len(auxdata)
+nbefore = len(stitched_raw_auxdata)
+stitched_raw_auxdata = gwlasso.remove_bad(stitched_raw_auxdata)
+nafter = len(stitched_raw_auxdata)
 logger.debug('Removed {0} channels with bad data'.format(nbefore - nafter))
 logger.debug('{0} channels remaining'.format(nafter))
+
+primaryts = stitched_raw_auxdata
+auxdata = stitched_raw_auxdata
 data = numpy.array([scale(ts.value) for ts in auxdata.values()]).T
 
 # -- perform lasso regression -------------------------------------------------
 
 # create model
-logger.info('-- Fitting data to target')
 target = scale(primaryts.value)
 model = gwlasso.fit(data, target, alpha=args.alpha)
 logger.info('Alpha: {}'.format(model.alpha))
@@ -675,9 +750,6 @@ for i, (ch, lassocoef, plot4, plot5, plot6, ts) in enumerate(results):
     # set container color/context based on lasso coefficient
     if lassocoef == 0:
         break
-    elif abs(lassocoef) < args.threshold:
-        h = '%s [lasso coefficient = %.4f] (Below threshold)' % (ch, lassocoef)
-    else:
         h = '%s [lasso coefficient = %.4f]' % (ch, lassocoef)
     if ((lassocoef is None) or (lassocoef == 0)
             or (abs(lassocoef) < args.threshold)):
