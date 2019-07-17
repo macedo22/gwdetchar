@@ -139,6 +139,7 @@ os.chdir(args.output_dir)
 
 # multiprocessing for plots
 nprocplot = (args.nproc_plot or args.nproc) if USETEX else 1
+re_delim = re.compile(r'[:_-]')
 
 # bandpass primary
 if args.band_pass:
@@ -162,20 +163,62 @@ if args.band_pass:
         stride = 60
     else:
         stride = 1
+    logger.debug('Beginning band pass')
     if flower:
-        darmblrms = (
+        darm = (
             bandts.highpass(flower/2., fstop=flower/4.,
                             filtfilt=False, ftype='butter')
             .notch(60, filtfilt=False)
             .bandpass(flower, fupper, fstop=[flower/2., fupper*1.5],
                       filtfilt=False, ftype='butter')
-            .crop(start, end).rms(stride))
+            .crop(start, end))
+        darmblrms = darm.rms(stride)
         darmblrms.name = '%s %s-%s Hz BLRMS' % (primary, flower, fupper)
     else:
-        darmblrms = bandts.notch(60).crop(start, end).rms(stride)
+        darm = bandts.notch(60).crop(start, end)
+        darmblrms = darm.rms(stride)
         darmblrms.name = '%s RMS' % primary
 
     primaryts = darmblrms
+    channelstub = re_delim.sub('_', str(args.primary_channel)).replace('_', '-', 1)
+
+    bandts_asd = bandts.asd(4, 2, method='median')
+    darm_asd = darm.asd(4, 2, method='median')
+    fig = bandts_asd.plot(label='Unfiltered', color='#ee0000')
+    ax = fig.gca()
+    ax.plot(darm_asd, label='Filtered', color='#92ddc8')
+    ax.set_xlim(10, 2000)
+    ax.set_ylim(1e-24, 2e-18)
+    ax.set_xlabel("Frequency [Hz]", fontsize='small')
+    ax.set_ylabel("GW amplitude spectral density [strain/$\sqrt{\mathrm{Hz}}]$",
+                  fontsize='small')
+    ax.set_title("%s band passed spectrum (zoomed out)" % channelstub,
+                 fontsize='small')
+    ax.legend(loc='best', fontsize='small')
+    gpsstub = '%d-%d' % (start, end-start)
+    spectrum_plot_zoomed_out_name = ('%s-_BAND_PASSED_SPECTRA_ZOOM_OUT-%s.png'
+                                     % (channelstub, gpsstub))
+    spectrum_plot_zoomed_out = gwplot.save_figure(
+        fig, spectrum_plot_zoomed_out_name, bbox_inches='tight')
+    fig.close()
+
+    fig = bandts_asd.plot(label='Unfiltered', color='#ee0000')
+    ax = fig.gca()
+    ax.plot(darm_asd, label='Filtered', color='#92ddc8')
+    ax.set_xlim(flower - ((fupper - flower) * 0.9),
+                fupper + ((fupper - flower) * 1.1))
+    ax.set_ylim(1e-24, 2e-18)
+    ax.set_xlabel("Frequency [Hz]", fontsize='small')
+    ax.set_ylabel("GW amplitude spectral density [strain/$\sqrt{\mathrm{Hz}}]$",
+                  fontsize='small')
+    ax.set_title("%s band passed spectrum (zoomed in)" % channelstub,
+                 fontsize='small')
+    ax.legend(loc='best', fontsize='small')
+    spectrum_plot_zoomed_in_name = ('%s-_BAND_PASSED_SPECTRA_ZOOM_IN-%s.png'
+                                    % (channelstub, gpsstub))
+    spectrum_plot_zoomed_in = gwplot.save_figure(
+        fig, spectrum_plot_zoomed_in_name, bbox_inches='tight')
+    fig.close()
 
 else:
     # load primary channel data
@@ -288,7 +331,7 @@ flattab.write(flatfile, format='ascii', overwrite=True)
 
 modelFit = model.predict(data)
 
-re_delim = re.compile(r'[:_-]')
+#re_delim = re.compile(r'[:_-]')
 form = '%%.%dd' % len(str(nchan))
 p1 = (.1, .15, .9, .9)  # global plot defaults for plot1, lasso model
 
@@ -566,7 +609,6 @@ def generate_cluster(input_,):
 
 
 if args.no_cluster is False:
-    logger.info("-- Generating clusters")
     pool = multiprocessing.Pool(nprocplot)
     clusters = pool.map(generate_cluster, enumerate(results))
 
@@ -575,7 +617,11 @@ numpy.savetxt(channelsfile, channels, fmt='%s')
 
 # write html
 title = '%s Lasso Slow Correlations: %d-%d' % (args.ifo, start, end)
-links = [(s, '#%s' % s.lower()) for s in ['Parameters', 'Model', 'Results']]
+if args.band_pass:
+    links = [(s, '#%s' % s.lower()) for s in ['Parameters', 'Spectra',
+                                              'Model', 'Results']]
+else:
+    links = [(s, '#%s' % s.lower()) for s in ['Parameters', 'Model', 'Results']]
 (brand, class_) = htmlio.get_brand(args.ifo, 'Lasso', start)
 navbar = htmlio.navbar(links, class_=class_, brand=brand)
 page = htmlio.new_bootstrap_page(title=title, navbar=navbar)
@@ -601,7 +647,21 @@ if args.band_pass:
     content.append(
         ('Filter settings',
          'Flow = {} Hz, Fhigh = {} Hz '.format(flower, fupper)))
+
 page.add(htmlio.write_arguments(content, start=start, end=end))
+
+if args.band_pass:
+    page.h2('Primary Channel Spectra', id_='spectra')
+    page.div(style_='display: flex;flex-wrap:nowrap;justify-content:space-around;')
+    page.div()
+    spectra_img1 = htmlio.FancyPlot(spectrum_plot_zoomed_out)
+    page.add(htmlio.fancybox_img(spectra_img1))
+    page.div.close()
+    page.div()
+    spectra_img2 = htmlio.FancyPlot(spectrum_plot_zoomed_in)
+    page.add(htmlio.fancybox_img(spectra_img2))
+    page.div.close()
+    page.div.close()
 
 page.h2('Model Information', id_='model')
 
